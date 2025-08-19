@@ -1,1 +1,1 @@
-## Unfinished for now... or forever
+## A humble todo app written in Go
