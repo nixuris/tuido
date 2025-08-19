@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -37,6 +38,8 @@ const (
 	KanbanView
 	StatsView
 	InputView
+	DateInputView
+	RemoveTagView
 )
 
 // InputMode represents different input dialogs
@@ -48,7 +51,6 @@ const (
 	AddContextInput
 	RenameContextInput
 	AddTagInput
-	SetDueDateInput
 	SearchInput
 	DeleteConfirmInput
 )
@@ -68,9 +70,15 @@ type Model struct {
 	searchResults   []Task
 	prevContext     string
 	prevIndex       int
+	movingMode      bool
+	movingTaskIndex int
 	
 	// Input handling
 	textInput       textinput.Model
+	dateInputs      []textinput.Model
+	dateInputIndex  int
+	removeTagIndex  int
+	removeTagChecks []bool
 	inputPrompt     string
 	
 	// UI state
@@ -92,27 +100,31 @@ type Model struct {
 
 // KeyMap defines key bindings
 type KeyMap struct {
-	Up           key.Binding
-	Down         key.Binding
-	Left         key.Binding
-	Right        key.Binding
-	Toggle       key.Binding
-	Add          key.Binding
-	Edit         key.Binding
-	Delete       key.Binding
-	Search       key.Binding
-	AddContext   key.Binding
-	RenameContext key.Binding
-	DeleteContext key.Binding
+	Up             key.Binding
+	Down           key.Binding
+	Left           key.Binding
+	Right          key.Binding
+	Toggle         key.Binding
+	Add            key.Binding
+	Edit           key.Binding
+	Delete         key.Binding
+	Search         key.Binding
+	AddContext     key.Binding
+	RenameContext  key.Binding
+	DeleteContext  key.Binding
 	TogglePriority key.Binding
-	AddTag       key.Binding
-	SetDueDate   key.Binding
-	KanbanView   key.Binding
-	StatsView    key.Binding
-	Undo         key.Binding
-	Quit         key.Binding
-	Back         key.Binding
-	Enter        key.Binding
+	AddTag         key.Binding
+	RemoveTag      key.Binding
+	SetDueDate     key.Binding
+	ClearDueDate   key.Binding
+	KanbanView     key.Binding
+	StatsView      key.Binding
+	Undo           key.Binding
+	Move           key.Binding
+	Quit           key.Binding
+	Back           key.Binding
+	Enter          key.Binding
+	Nav            key.Binding
 }
 
 // DefaultKeyMap returns default key bindings
@@ -174,9 +186,17 @@ func DefaultKeyMap() KeyMap {
 			key.WithKeys("t"),
 			key.WithHelp("t", "add tag"),
 		),
+		RemoveTag: key.NewBinding(
+			key.WithKeys("T"),
+			key.WithHelp("T", "remove tag"),
+		),
 		SetDueDate: key.NewBinding(
 			key.WithKeys("u"),
 			key.WithHelp("u", "due date"),
+		),
+		ClearDueDate: key.NewBinding(
+			key.WithKeys("U"),
+			key.WithHelp("U", "clear due"),
 		),
 		KanbanView: key.NewBinding(
 			key.WithKeys("v"),
@@ -190,6 +210,10 @@ func DefaultKeyMap() KeyMap {
 			key.WithKeys("z"),
 			key.WithHelp("z", "undo"),
 		),
+		Move: key.NewBinding(
+			key.WithKeys("m"),
+			key.WithHelp("m", "move"),
+		),
 		Quit: key.NewBinding(
 			key.WithKeys("q", "ctrl+c"),
 			key.WithHelp("q", "quit"),
@@ -201,6 +225,10 @@ func DefaultKeyMap() KeyMap {
 		Enter: key.NewBinding(
 			key.WithKeys("enter"),
 			key.WithHelp("enter", "confirm"),
+		),
+		Nav: key.NewBinding(
+			key.WithKeys("↑", "↓", "←", "→"),
+			key.WithHelp("↑↓←→", "navigation"),
 		),
 	}
 }
@@ -230,8 +258,7 @@ var (
 
 	completedTaskStyle = lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#A6E3A1")).
-		Strikethrough(true).
-		PaddingLeft(2)
+		Strikethrough(true)
 
 	// Priority styles
 	highPriorityStyle = lipgloss.NewStyle().
@@ -274,8 +301,17 @@ func Initialize() Model {
 	ti.CharLimit = 200
 	ti.Width = 50
 
+	dateInputs := make([]textinput.Model, 3)
+	for i := range dateInputs {
+		dateInputs[i] = textinput.New()
+		dateInputs[i].Focus()
+		dateInputs[i].CharLimit = 4
+		dateInputs[i].Width = 10
+	}
+
 	m := Model{
 		textInput:      ti,
+		dateInputs:     dateInputs,
 		keyMap:         DefaultKeyMap(),
 		help:           help.New(),
 		configPath:     configPath,
@@ -310,6 +346,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Handle input mode
 		if m.viewMode == InputView {
 			return m.updateInputMode(msg)
+		} else if m.viewMode == DateInputView {
+			return m.updateDateInputMode(msg)
+		} else if m.viewMode == RemoveTagView {
+			return m.updateRemoveTagMode(msg)
 		}
 
 		// Handle different view modes
@@ -363,12 +403,11 @@ func (m Model) updateInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.saveStateForUndo()
 				m.addTagToCurrentTask(input)
 			}
-		case SetDueDateInput:
-			m.saveStateForUndo()
-			m.setDueDateForCurrentTask(input)
 		case SearchInput:
 			if input != "" {
 				m.searchTasks(input)
+			} else {
+				m.viewMode = NormalView
 			}
 		case DeleteConfirmInput:
 			if strings.ToLower(input) == "y" {
@@ -385,6 +424,71 @@ func (m Model) updateInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// updateDateInputMode handles due date input updates
+func (m Model) updateDateInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch {
+	case key.Matches(msg, m.keyMap.Back):
+		m.viewMode = NormalView
+		return m, nil
+
+	case key.Matches(msg, m.keyMap.Enter):
+		day := m.dateInputs[0].Value()
+		month := m.dateInputs[1].Value()
+		year := m.dateInputs[2].Value()
+		dateStr := fmt.Sprintf("%s-%s-%s", year, month, day)
+		m.saveStateForUndo()
+		m.setDueDateForCurrentTask(dateStr)
+		m.viewMode = NormalView
+		return m, nil
+
+	case key.Matches(msg, m.keyMap.Up):
+		m.dateInputs[m.dateInputIndex].Blur()
+		m.dateInputIndex = (m.dateInputIndex - 1 + 3) % 3
+		m.dateInputs[m.dateInputIndex].Focus()
+
+	case key.Matches(msg, m.keyMap.Down):
+		m.dateInputs[m.dateInputIndex].Blur()
+		m.dateInputIndex = (m.dateInputIndex + 1) % 3
+		m.dateInputs[m.dateInputIndex].Focus()
+	}
+
+	m.dateInputs[m.dateInputIndex], cmd = m.dateInputs[m.dateInputIndex].Update(msg)
+	return m, cmd
+}
+
+// updateRemoveTagMode handles remove tag view updates
+func (m Model) updateRemoveTagMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, m.keyMap.Back):
+		m.viewMode = NormalView
+		return m, nil
+
+	case key.Matches(msg, m.keyMap.Enter):
+		m.saveStateForUndo()
+		m.removeTagsFromCurrentTask()
+		m.viewMode = NormalView
+		return m, nil
+
+	case key.Matches(msg, m.keyMap.Up):
+		if m.removeTagIndex > 0 {
+			m.removeTagIndex--
+		}
+
+	case key.Matches(msg, m.keyMap.Down):
+		task := m.getCurrentTask()
+		if m.removeTagIndex < len(task.Tags)-1 {
+			m.removeTagIndex++
+		}
+
+	case key.Matches(msg, m.keyMap.Toggle):
+		m.removeTagChecks[m.removeTagIndex] = !m.removeTagChecks[m.removeTagIndex]
+	}
+
+	return m, nil
+}
+
 // updateNormalView handles normal view updates
 func (m Model) updateNormalView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
@@ -399,10 +503,18 @@ func (m Model) updateNormalView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keyMap.Up):
-		m.moveUp()
+		if m.movingMode {
+			m.moveTaskUp()
+		} else {
+			m.moveUp()
+		}
 
 	case key.Matches(msg, m.keyMap.Down):
-		m.moveDown()
+		if m.movingMode {
+			m.moveTaskDown()
+		} else {
+			m.moveDown()
+		}
 
 	case key.Matches(msg, m.keyMap.Left):
 		m.previousContext()
@@ -457,9 +569,20 @@ func (m Model) updateNormalView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.showInputDialog(AddTagInput, "Add tag:")
 		}
 
+	case key.Matches(msg, m.keyMap.RemoveTag):
+		if len(m.getFilteredTasks()) > 0 {
+			m.showRemoveTagDialog()
+		}
+
 	case key.Matches(msg, m.keyMap.SetDueDate):
 		if len(m.getFilteredTasks()) > 0 {
-			m.showInputDialog(SetDueDateInput, "Due date (YYYY-MM-DD or 'clear'):")
+			m.showDateInputDialog()
+		}
+
+	case key.Matches(msg, m.keyMap.ClearDueDate):
+		if len(m.getFilteredTasks()) > 0 {
+			m.saveStateForUndo()
+			m.setDueDateForCurrentTask("clear")
 		}
 
 	case key.Matches(msg, m.keyMap.Search):
@@ -473,6 +596,16 @@ func (m Model) updateNormalView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keyMap.Undo):
 		m.undo()
+
+	case key.Matches(msg, m.keyMap.Move):
+		if len(m.getFilteredTasks()) > 0 {
+			m.movingMode = !m.movingMode
+			if m.movingMode {
+				m.movingTaskIndex = m.selectedIndex
+			} else {
+				m.saveStateForUndo()
+			}
+		}
 	}
 
 	return m, nil
@@ -481,7 +614,7 @@ func (m Model) updateNormalView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // updateKanbanView handles kanban view updates
 func (m Model) updateKanbanView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, m.keyMap.Back), key.Matches(msg, m.keyMap.Quit):
+	case key.Matches(msg, m.keyMap.Back), key.Matches(msg, m.keyMap.Quit), key.Matches(msg, m.keyMap.KanbanView):
 		m.viewMode = NormalView
 	}
 	return m, nil
@@ -490,7 +623,7 @@ func (m Model) updateKanbanView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // updateStatsView handles stats view updates  
 func (m Model) updateStatsView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case key.Matches(msg, m.keyMap.Back), key.Matches(msg, m.keyMap.Quit):
+	case key.Matches(msg, m.keyMap.Back), key.Matches(msg, m.keyMap.Quit), key.Matches(msg, m.keyMap.StatsView):
 		m.viewMode = NormalView
 	}
 	return m, nil
@@ -501,6 +634,10 @@ func (m Model) View() string {
 	switch m.viewMode {
 	case InputView:
 		return m.renderInputView()
+	case DateInputView:
+		return m.renderDateInputView()
+	case RemoveTagView:
+		return m.renderRemoveTagView()
 	case KanbanView:
 		return m.renderKanbanView()
 	case StatsView:
@@ -533,7 +670,7 @@ func (m Model) renderNormalView() string {
 		}
 	} else {
 		for i, task := range tasks {
-			taskLine := m.renderTask(task, i == m.selectedIndex)
+			taskLine := m.renderTask(task, i == m.selectedIndex, i == m.movingTaskIndex && m.movingMode)
 			content.WriteString(taskLine + "\n")
 		}
 	}
@@ -551,7 +688,7 @@ func (m Model) renderNormalView() string {
 }
 
 // renderTask renders a single task
-func (m Model) renderTask(task Task, selected bool) string {
+func (m Model) renderTask(task Task, selected, moving bool) string {
 	// Checkbox
 	checkbox := "[ ]"
 	if task.Checked {
@@ -569,14 +706,13 @@ func (m Model) renderTask(task Task, selected bool) string {
 		priority = lowPriorityStyle.Render("! ")
 	}
 
+	// Task text
+	taskText := task.Task
+
 	// Tags
 	tags := ""
 	if len(task.Tags) > 0 {
-		tagStrs := make([]string, len(task.Tags))
-		for i, tag := range task.Tags {
-			tagStrs[i] = "#" + tag
-		}
-		tags = " [" + strings.Join(tagStrs, ", ") + "]"
+		tags = " > " + strings.Join(task.Tags, ", ")
 	}
 
 	// Due date
@@ -586,7 +722,7 @@ func (m Model) renderTask(task Task, selected bool) string {
 	}
 
 	// Combine text
-	text := fmt.Sprintf("%s %s%s%s%s", checkbox, priority, task.Task, tags, dueDate)
+	text := fmt.Sprintf("%s %s%s%s", checkbox, taskText, tags, dueDate)
 
 	// Apply styles
 	style := taskStyle
@@ -598,7 +734,11 @@ func (m Model) renderTask(task Task, selected bool) string {
 		style = style.Copy().Background(lipgloss.Color("#313244"))
 	}
 
-	return style.Render(text)
+	if moving {
+		style = style.Copy().Bold(true)
+	}
+
+	return priority + style.Render(text)
 }
 
 // renderInputView renders input dialogs
@@ -606,6 +746,45 @@ func (m Model) renderInputView() string {
 	return inputStyle.Render(
 		fmt.Sprintf("%s\n\n%s", m.inputPrompt, m.textInput.View()),
 	)
+}
+
+// renderDateInputView renders due date input dialog
+func (m Model) renderDateInputView() string {
+	var content strings.Builder
+	content.WriteString("Set due date (YYYY-MM-DD):\n\n")
+	inputs := []string{
+		fmt.Sprintf("Day: %s", m.dateInputs[0].View()),
+		fmt.Sprintf("Month: %s", m.dateInputs[1].View()),
+		fmt.Sprintf("Year: %s", m.dateInputs[2].View()),
+	}
+	for i, input := range inputs {
+		if i == m.dateInputIndex {
+			content.WriteString(selectedTaskStyle.Render(input) + "\n")
+		} else {
+			content.WriteString(input + "\n")
+		}
+	}
+	return inputStyle.Render(content.String())
+}
+
+// renderRemoveTagView renders remove tag view
+func (m Model) renderRemoveTagView() string {
+	var content strings.Builder
+	content.WriteString("Select tags to remove:\n\n")
+	task := m.getCurrentTask()
+	for i, tag := range task.Tags {
+		checkbox := "[ ]"
+		if m.removeTagChecks[i] {
+			checkbox = "[✓]"
+		}
+		line := fmt.Sprintf("%s %s", checkbox, tag)
+		if i == m.removeTagIndex {
+			content.WriteString(selectedTaskStyle.Render(line) + "\n")
+		} else {
+			content.WriteString(line + "\n")
+		}
+	}
+	return inputStyle.Render(content.String())
 }
 
 // renderKanbanView renders the kanban board
@@ -643,10 +822,20 @@ func (m Model) renderKanbanView() string {
 				taskText = taskText[:colWidth-7] + "..."
 			}
 
+			tags := ""
+			if len(task.Tags) > 0 {
+				tags = " > " + strings.Join(task.Tags, ", ")
+			}
+
+			dueDate := ""
+			if task.DueDate != "" {
+				dueDate = fmt.Sprintf(" [Due: %s]", task.DueDate)
+			}
+
 			if task.Checked {
-				column.WriteString(completedTaskStyle.Render("✓ " + taskText) + "\n")
+				column.WriteString(completedTaskStyle.Render(fmt.Sprintf("✓ %s%s%s", taskText, tags, dueDate)) + "\n")
 			} else {
-				column.WriteString(taskStyle.Render("• " + taskText) + "\n")
+				column.WriteString(taskStyle.Render(fmt.Sprintf("• %s%s%s", taskText, tags, dueDate)) + "\n")
 			}
 		}
 
@@ -721,6 +910,29 @@ func (m *Model) showInputDialog(mode InputMode, prompt string) {
 	m.textInput.Focus()
 }
 
+func (m *Model) showDateInputDialog() {
+	m.viewMode = DateInputView
+	m.dateInputIndex = 0
+	now := time.Now()
+	m.dateInputs[0].SetValue(fmt.Sprintf("%02d", now.Day()))
+	m.dateInputs[1].SetValue(fmt.Sprintf("%02d", now.Month()))
+	m.dateInputs[2].SetValue(fmt.Sprintf("%d", now.Year()))
+	for i := range m.dateInputs {
+		m.dateInputs[i].Focus()
+	}
+}
+
+func (m *Model) showRemoveTagDialog() {
+	task := m.getCurrentTask()
+	if len(task.Tags) == 0 {
+		m.errorMessage = "No tags to remove"
+		return
+	}
+	m.viewMode = RemoveTagView
+	m.removeTagIndex = 0
+	m.removeTagChecks = make([]bool, len(task.Tags))
+}
+
 func (m *Model) getFilteredTasks() []Task {
 	if m.viewMode == SearchView {
 		return m.searchResults
@@ -757,6 +969,34 @@ func (m *Model) moveDown() {
 	tasks := m.getFilteredTasks()
 	if len(tasks) > 0 {
 		m.selectedIndex = (m.selectedIndex + 1) % len(tasks)
+	}
+}
+
+func (m *Model) moveTaskUp() {
+	tasks := m.getFilteredTasks()
+	if m.selectedIndex > 0 {
+		taskToMove := tasks[m.selectedIndex]
+		for i := range m.tasks {
+			if m.tasks[i].ID == taskToMove.ID {
+				m.tasks[i], m.tasks[i-1] = m.tasks[i-1], m.tasks[i]
+				break
+			}
+		}
+		m.selectedIndex--
+	}
+}
+
+func (m *Model) moveTaskDown() {
+	tasks := m.getFilteredTasks()
+	if m.selectedIndex < len(tasks)-1 {
+		taskToMove := tasks[m.selectedIndex]
+		for i := range m.tasks {
+			if m.tasks[i].ID == taskToMove.ID {
+				m.tasks[i], m.tasks[i+1] = m.tasks[i+1], m.tasks[i]
+				break
+			}
+		}
+		m.selectedIndex++
 	}
 }
 
@@ -976,6 +1216,27 @@ func (m *Model) addTagToCurrentTask(tag string) {
 	}
 }
 
+func (m *Model) removeTagsFromCurrentTask() {
+	tasks := m.getFilteredTasks()
+	if len(tasks) == 0 {
+		return
+	}
+
+	currentTask := tasks[m.selectedIndex]
+	for i := range m.tasks {
+		if m.tasks[i].ID == currentTask.ID {
+			var newTags []string
+			for j, tag := range m.tasks[i].Tags {
+				if !m.removeTagChecks[j] {
+					newTags = append(newTags, tag)
+				}
+			}
+			m.tasks[i].Tags = newTags
+			break
+		}
+	}
+}
+
 func (m *Model) setDueDateForCurrentTask(dateStr string) {
 	tasks := m.getFilteredTasks()
 	if len(tasks) == 0 {
@@ -1161,15 +1422,15 @@ func (m *Model) saveConfig() {
 
 // KeyMap methods to implement help.KeyMap interface
 func (k KeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Left, k.Right, k.Toggle, k.Add, k.Edit, k.Delete, k.Quit, k.KanbanView, k.AddContext, k.TogglePriority, k.RenameContext, k.SetDueDate, k.Undo}
+	return []key.Binding{k.Nav, k.Toggle, k.Add, k.Edit, k.Delete, k.Quit}
 }
 
 func (k KeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Up, k.Down, k.Left, k.Right},
-		{k.Toggle, k.Add, k.Edit, k.Delete},
+		{k.Nav},
+		{k.Toggle, k.Add, k.Edit, k.Delete, k.Move},
 		{k.AddContext, k.RenameContext, k.DeleteContext},
-		{k.TogglePriority, k.AddTag, k.SetDueDate},
+		{k.TogglePriority, k.AddTag, k.RemoveTag, k.SetDueDate, k.ClearDueDate},
 		{k.Search, k.KanbanView, k.StatsView},
 		{k.Undo, k.Back, k.Quit},
 	}
